@@ -42,6 +42,10 @@ headers = {'Authorization': 'Basic %s' % encoded_u}
 end_time = datetime.datetime.utcnow()
 start_time = end_time - datetime.timedelta(days=7)
 
+# Calculate the total number of requests (1 per hour)
+total_hours = int((end_time - start_time).total_seconds() / 3600)
+completed_requests = 0
+
 # Initialize an empty list to store the messagesBlocked data
 all_messages_blocked = []
 
@@ -61,6 +65,15 @@ while current_time < end_time:
     except requests.exceptions.RequestException as e:
         print(f"Failed to retrieve data for interval starting at {current_time}. Error: {e}")
     
+    # Update progress
+    completed_requests += 1
+    elapsed_time = completed_requests  # Assuming each request takes about 1 second
+    remaining_requests = total_hours - completed_requests
+    estimated_time_remaining = remaining_requests  # in seconds
+    eta = datetime.datetime.now() + datetime.timedelta(seconds=estimated_time_remaining)
+
+    print(f"Completed {completed_requests}/{total_hours} requests. ETA: {eta.strftime('%Y-%m-%d %H:%M:%S')}")
+
     # Sleep for a second to avoid hitting the API rate limit
     time.sleep(1)
     
