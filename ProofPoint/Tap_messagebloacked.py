@@ -44,6 +44,13 @@ def expand_messages_blocked(messages_blocked):
             expanded_data.append(base_data)
     return expanded_data
 
+# Function to filter data based on desired headers
+def filter_data(data, headers):
+    filtered_data = []
+    for item in data:
+        filtered_data.append({key: item.get(key, '') for key in headers})
+    return filtered_data
+
 # Function to save messagesBlocked data to CSV
 def save_to_csv(data, folder_name, filename):
     os.makedirs(folder_name, exist_ok=True)
@@ -119,8 +126,19 @@ while current_time < end_time:
 # Expand the messagesBlocked data
 expanded_data = expand_messages_blocked(all_messages_blocked)
 
-# Save the expanded data to a CSV file
+# Specify the headers to keep
+headers_to_keep = [
+    "threatsInfoMap", "spamScore", "phishScore", "messageTime", "impostorScore",
+    "malwareScore", "subject", "quarantineFolder", "quarantineRule", "messageID",
+    "threatID", "threatStatus", "classification", "detectionType", "threatURL",
+    "threatTime", "threat", "campaignId", "threatType"
+]
+
+# Filter the data to include only specified headers
+filtered_data = filter_data(expanded_data, headers_to_keep)
+
+# Save the filtered data to a CSV file
 folder_name = "proofpoint_data"
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 filename = f"messages_blocked_{timestamp}.csv"
-save_to_csv(expanded_data, folder_name, filename)
+save_to_csv(filtered_data, folder_name, filename)
