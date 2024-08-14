@@ -30,7 +30,7 @@ def clean_data(data):
 # Function to extract classifications from threatsInfoMap
 def extract_classifications(data):
     if 'threatsInfoMap' in data:
-        classifications = [threat['classification'] for threat in data['threatsInfoMap']]
+        classifications = [threat.get('classification', '') for threat in data['threatsInfoMap']]
         return ', '.join(classifications)
     return ''
 
@@ -45,6 +45,11 @@ def save_to_excel(data, folder_name, filename):
     
     df = pd.DataFrame(cleaned_data)
     df.columns = [col.replace('[', '').replace(']', '').replace(',', ';') for col in df.columns]
+    
+    # Ensure all columns are converted to string type to avoid Excel formula parsing
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+    
     file_path = os.path.join(folder_name, filename)
     df.to_excel(file_path, index=False)
     print(f"Data has been saved to {file_path}")
