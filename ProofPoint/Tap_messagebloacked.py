@@ -27,31 +27,35 @@ def clean_data(data):
         return data.replace('[', '').replace(']', '').replace(',', ';')
     return data
 
-# Function to extract classifications from threatsInfoMap
-def extract_classifications(data):
-    if 'threatsInfoMap' in data:
-        classifications = [threat.get('classification', '') for threat in data['threatsInfoMap']]
-        return ', '.join(classifications)
-    return ''
+# Function to expand messagesBlocked and create a row for each threat
+def expand_messages_blocked(messages_blocked):
+    expanded_data = []
+    for message in messages_blocked:
+        base_data = clean_data(message)
+        base_data.pop('threatsInfoMap', None)  # Remove threatsInfoMap to avoid duplication
+        if 'threatsInfoMap' in message:
+            for threat in message['threatsInfoMap']:
+                threat_data = clean_data(threat)
+                # Merge base message data with threat data
+                row_data = {**base_data, **threat_data}
+                expanded_data.append(row_data)
+        else:
+            # If no threatsInfoMap, add the base message data as is
+            expanded_data.append(base_data)
+    return expanded_data
 
-# Function to save messagesBlocked data to Excel
-def save_to_excel(data, folder_name, filename):
+# Function to save messagesBlocked data to CSV
+def save_to_csv(data, folder_name, filename):
     os.makedirs(folder_name, exist_ok=True)
-    cleaned_data = clean_data(data)
-    
-    # Extract classifications and add to cleaned data
-    for item in cleaned_data:
-        item['Classifications'] = extract_classifications(item)
-    
-    df = pd.DataFrame(cleaned_data)
+    df = pd.DataFrame(data)
     df.columns = [col.replace('[', '').replace(']', '').replace(',', ';') for col in df.columns]
     
-    # Ensure all columns are converted to string type to avoid Excel formula parsing
+    # Ensure all columns are converted to string type to avoid issues
     for col in df.columns:
         df[col] = df[col].astype(str)
     
     file_path = os.path.join(folder_name, filename)
-    df.to_excel(file_path, index=False)
+    df.to_csv(file_path, index=False)
     print(f"Data has been saved to {file_path}")
 
 # Read credentials from the credentials file
@@ -112,8 +116,11 @@ while current_time < end_time:
     
     current_time = next_time
 
-# Save the messagesBlocked data to an Excel file
+# Expand the messagesBlocked data
+expanded_data = expand_messages_blocked(all_messages_blocked)
+
+# Save the expanded data to a CSV file
 folder_name = "proofpoint_data"
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-filename = f"messages_blocked_{timestamp}.xlsx"
-save_to_excel(all_messages_blocked, folder_name, filename)
+filename = f"messages_blocked_{timestamp}.csv"
+save_to_csv(expanded_data, folder_name, filename)
