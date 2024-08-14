@@ -27,10 +27,22 @@ def clean_data(data):
         return data.replace('[', '').replace(']', '').replace(',', ';')
     return data
 
+# Function to extract classifications from threatsInfoMap
+def extract_classifications(data):
+    if 'threatsInfoMap' in data:
+        classifications = [threat['classification'] for threat in data['threatsInfoMap']]
+        return ', '.join(classifications)
+    return ''
+
 # Function to save messagesBlocked data to Excel
 def save_to_excel(data, folder_name, filename):
     os.makedirs(folder_name, exist_ok=True)
     cleaned_data = clean_data(data)
+    
+    # Extract classifications and add to cleaned data
+    for item in cleaned_data:
+        item['Classifications'] = extract_classifications(item)
+    
     df = pd.DataFrame(cleaned_data)
     df.columns = [col.replace('[', '').replace(']', '').replace(',', ';') for col in df.columns]
     file_path = os.path.join(folder_name, filename)
