@@ -5,6 +5,7 @@ import time
 import json
 import pandas as pd
 import urllib3
+import os
 from urllib3.exceptions import InsecureRequestWarning
 
 # Suppress only the single InsecureRequestWarning from urllib3
@@ -15,11 +16,26 @@ def read_credentials(filename):
     with open(filename, 'r') as file:
         return json.load(file)
 
+# Function to clean data and handle special characters
+def clean_data(data):
+    if isinstance(data, list):
+        return [clean_data(item) for item in data]
+    if isinstance(data, dict):
+        return {key: clean_data(value) for key, value in data.items()}
+    if isinstance(data, str):
+        # Replace square brackets and commas
+        return data.replace('[', '').replace(']', '').replace(',', ';')
+    return data
+
 # Function to save messagesBlocked data to Excel
-def save_to_excel(data, filename):
-    df = pd.DataFrame(data)
-    df.to_excel(filename, index=False)
-    print(f"Data has been saved to {filename}")
+def save_to_excel(data, folder_name, filename):
+    os.makedirs(folder_name, exist_ok=True)
+    cleaned_data = clean_data(data)
+    df = pd.DataFrame(cleaned_data)
+    df.columns = [col.replace('[', '').replace(']', '').replace(',', ';') for col in df.columns]
+    file_path = os.path.join(folder_name, filename)
+    df.to_excel(file_path, index=False)
+    print(f"Data has been saved to {file_path}")
 
 # Read credentials from the credentials file
 credentials = read_credentials('credentials.json')
@@ -80,4 +96,7 @@ while current_time < end_time:
     current_time = next_time
 
 # Save the messagesBlocked data to an Excel file
-save_to_excel(all_messages_blocked, 'messages_blocked.xlsx')
+folder_name = "proofpoint_data"
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+filename = f"messages_blocked_{timestamp}.xlsx"
+save_to_excel(all_messages_blocked, folder_name, filename)
