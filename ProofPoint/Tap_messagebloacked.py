@@ -35,7 +35,6 @@ def clean_data(data):
     if isinstance(data, dict):
         return {key: clean_data(value) for key, value in data.items()}
     if isinstance(data, str):
-        # Replace square brackets and commas with semicolons
         return data.replace('[', '').replace(']', '').replace(',', ';')
     return data
 
@@ -48,11 +47,9 @@ def expand_messages_blocked(messages_blocked):
         if 'threatsInfoMap' in message:
             for threat in message['threatsInfoMap']:
                 threat_data = clean_data(threat)
-                # Merge base message data with threat data
                 row_data = {**base_data, **threat_data}
                 expanded_data.append(row_data)
         else:
-            # No threatsInfoMap, add the base message data
             expanded_data.append(base_data)
     return expanded_data
 
@@ -78,7 +75,6 @@ def save_to_csv(data, folder_name, filename):
     os.makedirs(folder_name, exist_ok=True)
     df = pd.DataFrame(data)
     
-    # Clean column names and ensure all columns are strings
     df.columns = [col.replace('[', '').replace(']', '').replace(',', ';') for col in df.columns]
     for col in df.columns:
         df[col] = df[col].astype(str)
@@ -99,15 +95,22 @@ def api_request(url, headers, retries=5, backoff_factor=1):
         except Exception as err:
             logging.error(f"Other error occurred: {err}")
         
-        # Exponential backoff for retries
         time.sleep(backoff_factor * (2 ** retry))
     raise Exception(f"Failed to fetch data after {retries} attempts")
 
+# Function to calculate the ETA
+def calculate_eta(start_time, completed, total):
+    elapsed_time = (datetime.datetime.utcnow() - start_time).total_seconds()
+    remaining_requests = total - completed
+    avg_time_per_request = elapsed_time / completed if completed > 0 else 0
+    estimated_time_remaining = remaining_requests * avg_time_per_request
+    eta = datetime.datetime.utcnow() + datetime.timedelta(seconds=estimated_time_remaining)
+    return eta, estimated_time_remaining
+
 # Main function to run the data extraction process
-def extract_proofpoint_data():
+def extract_proofpoint_data(verbose=False):
     credentials = read_credentials('credentials.json')
 
-    # Define request parameters
     req = {
         'principal': credentials['principal'], 
         'secret': credentials['secret'], 
@@ -116,20 +119,20 @@ def extract_proofpoint_data():
         'parameters': '?format=json'
     }
 
-    # Create the basic auth header
     userpass = f"{req['principal']}:{req['secret']}"
     encoded_u = base64.b64encode(userpass.encode()).decode()
     headers = {'Authorization': f'Basic {encoded_u}'}
 
-    # Set time range (last 7 days)
     end_time = datetime.datetime.utcnow()
     start_time = end_time - datetime.timedelta(days=7)
     
     total_hours = int((end_time - start_time).total_seconds() / 3600)
     completed_requests = 0
     all_messages_blocked = []
+    
+    # Start time for ETA calculation
+    process_start_time = datetime.datetime.utcnow()
 
-    # Loop through each hour
     current_time = start_time
     while current_time < end_time:
         next_time = current_time + datetime.timedelta(hours=1)
@@ -140,20 +143,25 @@ def extract_proofpoint_data():
             response_data = api_request(url, headers)
             if 'messagesBlocked' in response_data:
                 all_messages_blocked.extend(response_data['messagesBlocked'])
-            logging.info(f"Successfully retrieved data for {current_time}")
+            if verbose:
+                logging.info(f"Successfully retrieved data for {current_time}")
         except Exception as e:
             logging.error(f"Failed to retrieve data for {current_time}: {e}")
         
-        # Update progress
         completed_requests += 1
-        logging.info(f"Completed {completed_requests}/{total_hours} requests")
+
+        # Calculate and log ETA
+        eta, remaining_seconds = calculate_eta(process_start_time, completed_requests, total_hours)
+        logging.info(f"Completed {completed_requests}/{total_hours} requests. ETA: {eta.strftime('%Y-%m-%d %H:%M:%S')} (Remaining: {remaining_seconds:.2f} seconds)")
+
+        if verbose:
+            print(f"Completed {completed_requests}/{total_hours} requests. ETA: {eta.strftime('%Y-%m-%d %H:%M:%S')} (Remaining: {remaining_seconds:.2f} seconds)")
+        
         current_time = next_time
     
-    # Process the data
     expanded_data = expand_messages_blocked(all_messages_blocked)
     expanded_data = split_threat_time(expanded_data)
 
-    # Filter to include only specified headers
     headers_to_keep = [
         "threatsInfoMap", "spamScore", "phishScore", "messageTime", "impostorScore",
         "malwareScore", "subject", "quarantineFolder", "quarantineRule", "messageID",
@@ -162,11 +170,10 @@ def extract_proofpoint_data():
     ]
     filtered_data = filter_data(expanded_data, headers_to_keep)
 
-    # Save to CSV
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     folder_name = f"proofpoint_Email_Security_{timestamp}"
     filename = "Email_security.csv"
     save_to_csv(filtered_data, folder_name, filename)
 
 if __name__ == "__main__":
-    extract_proofpoint_data()
+    extract_proofpoint_data(verbose=True)
