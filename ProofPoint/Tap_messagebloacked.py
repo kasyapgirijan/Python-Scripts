@@ -44,6 +44,22 @@ def expand_messages_blocked(messages_blocked):
             expanded_data.append(base_data)
     return expanded_data
 
+# Function to split threatTime into separate date and time columns
+def split_threat_time(data):
+    for item in data:
+        if 'threatTime' in item and item['threatTime']:
+            try:
+                # Parse the threatTime to a datetime object
+                threat_datetime = datetime.datetime.strptime(item['threatTime'], "%Y-%m-%dT%H:%M:%S.%fZ")
+                # Add new keys for threatDate and threatTimeSplit
+                item['threatDate'] = threat_datetime.strftime("%Y-%m-%d")
+                item['threatTimeSplit'] = threat_datetime.strftime("%H:%M:%S")
+            except ValueError:
+                # Handle cases where threatTime is not in the expected format
+                item['threatDate'] = ''
+                item['threatTimeSplit'] = ''
+    return data
+
 # Function to filter data based on desired headers
 def filter_data(data, headers):
     filtered_data = []
@@ -125,20 +141,25 @@ while current_time < end_time:
 
 # Expand the messagesBlocked data
 expanded_data = expand_messages_blocked(all_messages_blocked)
+expanded_data = split_threat_time(expanded_data)
 
-# Specify the headers to keep
+# Specify the headers to keep (including new columns for threatDate and threatTimeSplit)
 headers_to_keep = [
     "threatsInfoMap", "spamScore", "phishScore", "messageTime", "impostorScore",
     "malwareScore", "subject", "quarantineFolder", "quarantineRule", "messageID",
     "threatID", "threatStatus", "classification", "detectionType", "threatURL",
-    "threatTime", "threat", "campaignId", "threatType"
+    "threatTime", "threatDate", "threatTimeSplit", "threat", "campaignId", "threatType"
 ]
 
 # Filter the data to include only specified headers
 filtered_data = filter_data(expanded_data, headers_to_keep)
 
-# Save the filtered data to a CSV file
-folder_name = "proofpoint_data"
+# Generate a timestamp for folder naming
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-filename = f"messages_blocked_{timestamp}.csv"
+
+# Specify the folder name with timestamp and the fixed filename
+folder_name = f"proofpoint_Email_Security_{timestamp}"
+filename = "Email_security.csv"
+
+# Save the filtered data to a CSV file in the specified folder
 save_to_csv(filtered_data, folder_name, filename)
