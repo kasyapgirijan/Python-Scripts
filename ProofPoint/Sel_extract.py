@@ -1,12 +1,17 @@
+import os
+import time
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.edge.service import Service
 from selenium.webdriver.edge.options import Options
-import time
-import os
+
+# Define the root directory for all paths
+ROOT_DIR = "C:/path/to/your/project"  # Replace with your project's root directory
+DOWNLOAD_DIR = os.path.join(ROOT_DIR, "downloads")  # Directory to save downloads
+WEBDRIVER_PATH = os.path.join(ROOT_DIR, "drivers", "edgedriver.exe")  # Path to EdgeDriver
 
 # Setup Edge WebDriver with options for SSO
-def setup_edge_driver(download_path):
+def setup_edge_driver():
     edge_options = Options()
     edge_options.add_argument("--start-maximized")  # Start maximized
     # Uncomment for headless mode
@@ -15,7 +20,7 @@ def setup_edge_driver(download_path):
     
     # Set up download preferences
     prefs = {
-        "download.default_directory": download_path,  # Set default download directory
+        "download.default_directory": DOWNLOAD_DIR,  # Set default download directory
         "download.prompt_for_download": False,        # Disable download prompt
         "download.directory_upgrade": True,           # Auto upgrade if directory exists
         "safebrowsing.enabled": True                  # Allow downloads
@@ -27,8 +32,7 @@ def setup_edge_driver(download_path):
     edge_options.add_argument("--auth-server-whitelist=*")
     edge_options.add_argument("--auth-negotiate-delegate-whitelist=*")
 
-    driver_path = "path/to/edgedriver"  # Replace with your EdgeDriver path
-    service = Service(driver_path)
+    service = Service(WEBDRIVER_PATH)
     driver = webdriver.Edge(service=service, options=edge_options)
     return driver
 
@@ -59,12 +63,11 @@ def download_dashboard_data(driver, url, download_button_selector):
 if __name__ == "__main__":
     url = "https://proofpoint-tap-dashboard-url"  # Replace with the actual URL
     download_button_selector = "button.download-button-class"  # Replace with the button's actual CSS selector
-    download_path = "path/to/download/directory"  # Replace with your desired download path
 
     # Ensure the download directory exists
-    if not os.path.exists(download_path):
-        os.makedirs(download_path)
+    if not os.path.exists(DOWNLOAD_DIR):
+        os.makedirs(DOWNLOAD_DIR)
 
     # Set up WebDriver and start the download process
-    driver = setup_edge_driver(download_path)
+    driver = setup_edge_driver()
     download_dashboard_data(driver, url, download_button_selector)
