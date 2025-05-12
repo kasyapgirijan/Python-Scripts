@@ -71,7 +71,7 @@ def process_report(report_type, workbook):
 
         # Remove Rows where uernemail matches sso_id@whateverdomain.com
         if report_type == 'users':
-            df['sso_id_email'] = df['sso_id'] + '@transunion.com'
+            df['sso_id_email'] = df['sso_id'] + '@organization.com'
             df = df[~df['useremailaddress'].isin(df['sso_id_email'])]
 
         df.to_excel(workbook, sheet_name=report_type.capitalize(), index=False)
