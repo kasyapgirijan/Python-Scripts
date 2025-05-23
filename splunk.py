@@ -5,9 +5,7 @@ import logging
 import requests
 import psycopg2
 import pandas as pd
-import hashlib
 from io import StringIO
-from datetime import datetime
 
 # ========== SETUP ==========
 LOGFILE = "splunk_sync.log"
@@ -19,11 +17,11 @@ INI_FILE = "dbconfig.ini"
 INI_SECTION = "database"
 SPLUNK_KEY_FILE = "splunk_api.key"
 SPLUNK_HOST = "https://localhost:8089"
-SPLUNK_RANGE_DAYS = 365  # Set to 1 when running daily
+SPLUNK_RANGE_DAYS = 365  # Change to 1 when running as daily cron job
 SPLUNK_SEARCH = f"search=savedsearch CDOC_Metrics&output_mode=csv&earliest_time=-{SPLUNK_RANGE_DAYS}d&latest=now"
 VERIFY_SSL = False
 TABLE_NAME = 'mod_cdoc_metrics'
-UNIQUE_COLS = ['timestamp', 'user_id']  # Adjust based on your Splunk data
+PRIMARY_KEY = 'id'
 
 # ========== FUNCTION: Read DB Config ==========
 def read_config(filename=INI_FILE, section=INI_SECTION):
@@ -52,15 +50,14 @@ def read_splunk_token(key_file=SPLUNK_KEY_FILE):
     with open(key_file, 'r') as f:
         return f"Splunk {f.read().strip()}"
 
-# ========== FUNCTION: Unique Hash ==========
-def generate_unique_id(row, cols):
-    concat = '|'.join(str(row[col]) for col in cols)
-    return hashlib.sha256(concat.encode('utf-8')).hexdigest()
-
 # ========== FUNCTION: Create SQL ==========
 def create_table_sql(df, table_name):
-    col_defs = [f'"{col}" TEXT' for col in df.columns if col != 'record_hash']
-    col_defs.append('"record_hash" TEXT PRIMARY KEY')
+    col_defs = []
+    for col in df.columns:
+        if col == PRIMARY_KEY:
+            col_defs.append(f'"{col}" TEXT PRIMARY KEY')
+        else:
+            col_defs.append(f'"{col}" TEXT')
     return f'CREATE TABLE IF NOT EXISTS "{table_name}" ({", ".join(col_defs)});'
 
 # ========== MAIN ==========
@@ -77,7 +74,6 @@ try:
     }
 
     export_url = f"{SPLUNK_HOST}/servicesNS/-/-/search/jobs/export?{SPLUNK_SEARCH}"
-
     logger.info(f"Querying Splunk: {export_url}")
     response = requests.get(export_url, headers=headers, stream=True, verify=VERIFY_SSL)
     response.raise_for_status()
@@ -94,24 +90,20 @@ try:
     # Normalize columns
     df.columns = [col.lower().replace(" ", "_").replace(".", "_") for col in df.columns]
 
-    # Generate record_hash for deduplication
-    for col in UNIQUE_COLS:
-        if col not in df.columns:
-            raise ValueError(f"Expected column '{col}' not in data")
-    df['record_hash'] = df.apply(lambda row: generate_unique_id(row, UNIQUE_COLS), axis=1)
+    if PRIMARY_KEY not in df.columns:
+        raise ValueError(f"Expected column '{PRIMARY_KEY}' not found in data")
 
-    # Create table
+    # Create table and insert
     conn = psycopg2.connect(**db_config)
     cur = conn.cursor()
     cur.execute(create_table_sql(df, TABLE_NAME))
 
-    # Insert data with ON CONFLICT DO NOTHING
     columns = df.columns.tolist()
     placeholders = ', '.join(['%s'] * len(columns))
     insert_query = f"""
         INSERT INTO "{TABLE_NAME}" ({', '.join(columns)})
         VALUES ({placeholders})
-        ON CONFLICT (record_hash) DO NOTHING;
+        ON CONFLICT ({PRIMARY_KEY}) DO NOTHING;
     """
 
     inserted = 0
