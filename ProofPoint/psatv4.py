@@ -273,3 +273,192 @@ def extract_user_tags(attributes: dict) -> dict:
     return out
 
 def fetch_report(report_type: str, api_key: str, seen_id: Optional[str]) -> Tuple[pd.DataFrame, Optional[str]]:
+    """
+    Fetch a report incrementally:
+      - follow links.next if present; else page[number]
+      - stop when previously-seen id encountered
+      - return DataFrame + newest_id (top-most id from first non-empty page)
+    """
+    session = requests.Session()
+    headers = {"x-apikey-token": api_key}
+
+    # first URL
+    api_url = f"{BASE_URL}{report_type}?"
+    if report_type == "users":
+        api_url += "user_tag_enabled&"
+    next_url = f"{api_url}page[size]=8000&filter[_includedeletedusers]=TRUE"
+
+    page = 0
+    newest_id = None
+    stop = False
+    rows: List[dict] = []
+
+    while next_url and not stop:
+        page += 1
+        logger.info(f"[{report_type}] Fetching page {page} ...")
+        try:
+            resp = session.get(next_url, headers=headers, timeout=60)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"[{report_type}] Request error: {e}")
+            break
+
+        if resp.status_code == 429:
+            retry_after = int(resp.headers.get("Retry-After", 60))
+            logger.warning(f"[{report_type}] Rate limit hit. Sleeping {retry_after}s...")
+            time.sleep(retry_after)
+            continue
+
+        if resp.status_code != 200:
+            logger.error(f"[{report_type}] API returned {resp.status_code}: {resp.text[:300]}")
+            break
+
+        payload = resp.json()
+        items = payload.get("data", []) or []
+        if not items:
+            break
+
+        if newest_id is None:
+            newest_id = items[0].get("id")
+
+        for it in items:
+            if seen_id and it.get("id") == seen_id:
+                logger.info(f"[{report_type}] Reached previously seen id={seen_id}; stopping.")
+                stop = True
+                break
+
+            attrs = it.get("attributes", {}) or {}
+            row = {"id": it.get("id"), "type": it.get("type")}
+            # flatten attributes (keep usertags encoded as JSON text)
+            for k, v in attrs.items():
+                if isinstance(v, (dict, list)):
+                    if k == "usertags":
+                        row["usertags"] = json.dumps(v, ensure_ascii=False)
+                    continue
+                row[k] = v
+
+            rows.append(row)
+
+        # follow links.next or fallback to page[number]
+        next_url = (payload.get("links") or {}).get("next")
+        if not next_url:
+            next_url = f"{api_url}page[number]={page+1}&page[size]=8000&filter[_includedeletedusers]=TRUE"
+
+    logger.info(f"[{report_type}] fetched {len(rows)} new rows.")
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    # Normalize one known edge case
+    if "location_1" in df.columns and pd.api.types.is_string_dtype(df["location_1"]):
+        df["location_1"] = df["location_1"].str.replace("São Paulo", "Sao Paulo", regex=False)
+
+    return df, newest_id
+
+# =========================
+# DB write (UPSERT, no truncates)
+# =========================
+def upsert_dataframe(conn, df: pd.DataFrame, table: str, schema: Dict[str, str]) -> None:
+    """
+    1) Align/cast to schema (including numpy.bool_ -> bool conversion)
+    2) Compute row_hash
+    3) Ensure table & index
+    4) UPSERT with ON CONFLICT(id) DO UPDATE ... WHERE row changed
+    """
+    if df is None or df.empty:
+        return
+
+    # align & types
+    aligned = cast_dataframe_types(df, schema)
+
+    # compute row_hash on all columns except row_hash itself
+    cols_for_hash = [c for c in aligned.columns if c != "row_hash"]
+    aligned["row_hash"] = aligned.apply(lambda r: compute_row_hash(r, cols_for_hash), axis=1)
+
+    # create table if missing
+    ensure_table(conn, table, schema)
+    ensure_unique_index_on_id(conn, table)
+
+    cols = list(aligned.columns)
+    col_sql = ", ".join([f'"{c}"' for c in cols])
+    set_sql = ", ".join(
+        [f'"{c}" = EXCLUDED."{c}"' for c in cols if c not in ("id", "row_hash")] + ['"row_hash" = EXCLUDED."row_hash"']
+    )
+    upsert_sql = f"""
+        INSERT INTO "{table}" ({col_sql})
+        VALUES %s
+        ON CONFLICT ("id") DO UPDATE
+        SET {set_sql}
+        WHERE "{table}"."row_hash" IS DISTINCT FROM EXCLUDED."row_hash";
+    """
+
+    # ensure Python-native bools before sending to psycopg2 (safety)
+    def py_boolify(x):
+        return x if isinstance(x, bool) or x is None else (bool(x) if str(x).lower() in {"true","t","1","yes"} else (False if str(x).lower() in {"false","f","0","no"} else x))
+    for c, t in schema.items():
+        if t.upper() == "BOOLEAN" and c in aligned.columns:
+            aligned[c] = aligned[c].map(py_boolify)
+
+    values = [tuple(row) for row in aligned.itertuples(index=False, name=None)]
+    with conn.cursor() as cur:
+        execute_values(cur, upsert_sql, values, page_size=1000)
+    conn.commit()
+    logger.info(f'Upserted {len(aligned)} rows into "{table}".')
+
+# =========================
+# Main
+# =========================
+def main():
+    logger.info("Starting Proofpoint → Postgres incremental sync (DB-only).")
+    api_key = read_api_key()
+    db = read_db_config("proofpoint.ini", "postgresql")
+    if not test_db_connection(db):
+        logger.error("DB connection failed. Exiting.")
+        return
+
+    conn_params = dict(host=db["host"], port=db["port"], dbname=db["dbname"], user=db["user"], password=db["password"])
+
+    # read watermarks
+    with psycopg2.connect(**conn_params) as conn:
+        ensure_state_table(conn)
+        seen_ids = {rt: get_last_seen_id(conn, rt) for rt in REPORT_TYPES}
+
+    # fetch in parallel
+    results: Dict[str, pd.DataFrame] = {}
+    newest_ids: Dict[str, Optional[str]] = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(REPORT_TYPES))) as ex:
+        future_map = {ex.submit(fetch_report, rt, api_key, seen_ids.get(rt)): rt for rt in REPORT_TYPES}
+        for fut in as_completed(future_map):
+            rt = future_map[fut]
+            try:
+                df, top_id = fut.result()
+                results[rt] = df
+                newest_ids[rt] = top_id
+            except Exception as e:
+                logger.error(f"Error fetching {rt}: {e}")
+                results[rt] = pd.DataFrame()
+                newest_ids[rt] = None
+
+    # upsert to DB
+    with psycopg2.connect(**conn_params) as conn:
+        for rt, df in results.items():
+            table = TABLE_MAPPING.get(rt)
+            if not table or df is None or df.empty:
+                continue
+            schema = DB_SCHEMAS[table]
+            upsert_dataframe(conn, df, table, schema)
+
+    # persist new watermarks
+    with psycopg2.connect(**conn_params) as conn:
+        for rt, nid in newest_ids.items():
+            if nid:
+                set_last_seen_id(conn, rt, nid)
+
+    logger.info("Incremental sync complete.")
+
+# =========================
+# Entrypoint
+# =========================
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise
