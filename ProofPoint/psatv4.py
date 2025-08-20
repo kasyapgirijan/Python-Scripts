@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import time
 import json
+import time
 import base64
-import hashlib
 import logging
 import configparser
-from datetime import datetime
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
-from pandas.api.types import (
-    is_integer_dtype,
-    is_float_dtype,
-    is_bool_dtype,
-    is_datetime64_any_dtype,
-)
 
-# ---------------------------------
+# =========================
 # Logging
-# ---------------------------------
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -31,92 +25,81 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------------
-# Constants
-# ---------------------------------
+# =========================
+# API constants
+# =========================
 BASE_URL = "https://results.us.securityeducation.com/api/reporting/v0.3.0/"
-REPORT_TYPES = ["users", "phishing"]     # add "training" later if needed
-DEFAULT_SSO_DOMAIN = "Org.com"    # can be overridden in [app] sso_domain
+REPORT_TYPES = ["users", "phishing"]  # enable more later if needed
 
-# Map API report -> DB table
-TABLE_MAPPING = {
-    "users": "Mod_ThreatAwareness_Users",
+# =========================
+# DB schema (whitelists + types)
+# Keys = destination table names; values = {column: pg_type}
+# Adjust as needed to match exactly what you want to store.
+# =========================
+DB_SCHEMAS: Dict[str, Dict[str, str]] = {
+    "Mod_ThreatAwareness_Phishing": {
+        # core
+        "id": "TEXT",
+        "type": "TEXT",
+        "eventtype": "TEXT",
+        "eventtimestamp": "TIMESTAMPTZ",
+        "senttimestamp": "TIMESTAMPTZ",
+        # campaign metadata
+        "campaigntype": "TEXT",
+        "campaignname": "TEXT",
+        "campaignstatus": "TEXT",
+        "campaignstartdate": "TIMESTAMPTZ",
+        "campaignenddate": "TIMESTAMPTZ",
+        # template
+        "templatename": "TEXT",
+        "templatesubject": "TEXT",
+        # flags
+        "assessmentsarchived": "BOOLEAN",
+        "autoenrollment": "BOOLEAN",
+        # user identity
+        "sso_id": "TEXT",
+        "useremailaddress": "TEXT",
+        "userfirstname": "TEXT",
+        "userlastname": "TEXT",
+        "useractiveflag": "BOOLEAN",
+        "userdeleteddate": "TIMESTAMPTZ",
+        # optional raw usertags (JSON-encoded as text)
+        "usertags": "TEXT",
+        # row_hash for update-on-change
+        "row_hash": "TEXT"
+    },
+    "Mod_ThreatAwareness_Users": {
+        "id": "TEXT",
+        "type": "TEXT",
+        "useremailaddress": "TEXT",
+        "userfirstname": "TEXT",
+        "userlastname": "TEXT",
+        "sso_id": "TEXT",
+        "department_1": "TEXT",
+        "location_1": "TEXT",
+        "office_location_1": "TEXT",
+        "manager_email_address_1": "TEXT",
+        "title_1": "TEXT",
+        "useractiveflag": "BOOLEAN",
+        "userdeleteddate": "TIMESTAMPTZ",
+        "userlocale": "TEXT",
+        "usertimezone": "TEXT",
+        "datalastupdated": "TIMESTAMPTZ",
+        "row_hash": "TEXT"
+    }
+}
+
+# report -> destination table mapping
+TABLE_MAPPING: Dict[str, str] = {
     "phishing": "Mod_ThreatAwareness_Phishing",
-    # "training": "Mod_ThreatAwareness_Training",
+    "users": "Mod_ThreatAwareness_Users",
 }
 
-# Keep only the columns you showed; cast timestamps/bools appropriately
-DB_SCHEMAS: Dict[str, Dict] = {
-    "phishing": {
-        "keep": [
-            "id",
-            "type",
-            "eventtype",
-            "eventtimestamp",
-            "senttimestamp",
-            "campaigntype",
-            "campaignname",
-            "campaignstatus",
-            "campaignstartdate",
-            "campaignenddate",
-            "templatename",
-            "templatesubject",
-            "assessmentsarchived",
-            "autoenrollment",
-            "sso_id",
-            "useremailaddress",
-            "userfirstname",
-            "userlastname",
-            "useractiveflag",
-            "userdeleteddate",
-            "usertags",             # will be JSON text if present
-        ],
-        "rename": {},
-        "dtypes": {
-            "eventtimestamp": "timestamp",
-            "senttimestamp": "timestamp",
-            "campaignstartdate": "timestamp",
-            "campaignenddate": "timestamp",
-            "userdeleteddate": "timestamp",
-            "assessmentsarchived": "bool",
-            "autoenrollment": "bool",
-            "useractiveflag": "bool",
-        },
-    },
-    "users": {
-        "keep": [
-            "id",
-            "type",
-            "useremailaddress",
-            "userfirstname",
-            "userlastname",
-            "sso_id",
-            "sso_id_email",               # we now keep this
-            "department_1",
-            "location_1",
-            "office_location_1",
-            "manager_email_address_1",
-            "title_1",
-            "useractiveflag",
-            "userdeleteddate",
-            "userlocale",
-            "usertimezone",
-            "datalastupdated",
-        ],
-        "rename": {},
-        "dtypes": {
-            "userdeleteddate": "timestamp",
-            "datalastupdated": "timestamp",
-            "useractiveflag": "bool",
-        },
-    },
-    # "training": {...}
-}
-
-# ---------------------------------
-# Config & credentials
-# ---------------------------------
+# =========================
+# Config / credentials
+# =========================
 def read_api_key() -> str:
+    """Get API key from env(API_KEY) or api_key.txt."""
     env_key = os.getenv("API_KEY")
     if env_key:
         return env_key.strip()
@@ -124,10 +107,11 @@ def read_api_key() -> str:
         with open("api_key.txt", "r") as f:
             return f.read().strip()
     except FileNotFoundError:
-        logger.error("api_key.txt not found. Provide API_KEY env var or create api_key.txt.")
+        logger.error("Provide API key via env var API_KEY or create api_key.txt.")
         raise
 
-def read_config(filename="proofpoint.ini", section="postgresql") -> dict:
+def read_db_config(filename: str = "proofpoint.ini", section: str = "postgresql") -> Dict[str, str]:
+    """Read DB config; supports base64-encoded or plain INI."""
     if not os.path.exists(filename):
         raise FileNotFoundError(f"Config file {filename} not found")
 
@@ -142,30 +126,19 @@ def read_config(filename="proofpoint.ini", section="postgresql") -> dict:
         parser.read(filename)
 
     if not parser.has_section(section):
-        raise RuntimeError(f"Section [{section}] not found in config")
+        raise RuntimeError(f"Section [{section}] not found in {filename}")
 
     db = {k: v for k, v in parser.items(section)}
-    # Force database name to Highlands_everest
-    db["dbname"] = "Highlands_everest"
-
-    # Optional app section
-    sso_domain = DEFAULT_SSO_DOMAIN
-    if parser.has_section("app"):
-        sso_domain = parser.get("app", "sso_domain", fallback=DEFAULT_SSO_DOMAIN)
-    db["sso_domain"] = sso_domain
-
-    for param in ["host", "port", "dbname", "user", "password"]:
-        if param not in db:
-            raise RuntimeError(f"DB config missing '{param}'")
+    for key in ["host", "port", "dbname", "user", "password"]:
+        if key not in db:
+            raise RuntimeError(f"DB config missing '{key}'")
     return db
 
-def test_db_connection(db_config) -> bool:
-    conn_params = (
-        f"host={db_config['host']} port={db_config['port']} "
-        f"dbname={db_config['dbname']} user={db_config['user']} password={db_config['password']}"
-    )
+def test_db_connection(db: Dict[str, str]) -> bool:
     try:
-        with psycopg2.connect(conn_params):
+        with psycopg2.connect(
+            host=db["host"], port=db["port"], dbname=db["dbname"], user=db["user"], password=db["password"]
+        ):
             pass
         logger.info("Database connection test successful.")
         return True
@@ -173,20 +146,18 @@ def test_db_connection(db_config) -> bool:
         logger.error(f"Database connection test failed: {e}")
         return False
 
-# ---------------------------------
+# =========================
 # Watermark state table
-# ---------------------------------
-def ensure_state_table_exists(conn):
+# =========================
+def ensure_state_table(conn) -> None:
     with conn.cursor() as cur:
-        cur.execute(
-            """
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS etl_sync_state (
-                report_type TEXT PRIMARY KEY,
-                last_success_ts TIMESTAMPTZ,
-                last_seen_id TEXT
+              report_type TEXT PRIMARY KEY,
+              last_success_ts TIMESTAMPTZ,
+              last_seen_id TEXT
             );
-            """
-        )
+        """)
     conn.commit()
 
 def get_last_seen_id(conn, report_type: str) -> Optional[str]:
@@ -197,102 +168,86 @@ def get_last_seen_id(conn, report_type: str) -> Optional[str]:
 
 def set_last_seen_id(conn, report_type: str, last_id: str) -> None:
     with conn.cursor() as cur:
-        cur.execute(
-            """
+        cur.execute("""
             INSERT INTO etl_sync_state (report_type, last_success_ts, last_seen_id)
             VALUES (%s, NOW(), %s)
             ON CONFLICT (report_type) DO UPDATE
-            SET last_success_ts = EXCLUDED.last_success_ts,
-                last_seen_id = EXCLUDED.last_seen_id
-            """,
-            (report_type, last_id),
-        )
+              SET last_success_ts = EXCLUDED.last_success_ts,
+                  last_seen_id = EXCLUDED.last_seen_id;
+        """, (report_type, last_id))
     conn.commit()
 
-# ---------------------------------
-# Table creation / indexes
-# ---------------------------------
-def ensure_table_exists(cur, table_name: str, df: pd.DataFrame) -> None:
+# =========================
+# Table creation helpers
+# =========================
+def ensure_table(conn, table_name: str, schema: Dict[str, str]) -> None:
     """
-    Create table if missing, inferring column types from df.
-    'id' becomes PRIMARY KEY.
+    Create table if not exists using fixed schema.
+    'id' is PRIMARY KEY (needed for upsert).
     """
-    col_defs = []
-    for col in df.columns:
-        if is_integer_dtype(df[col]):
-            sql_type = "BIGINT"
-        elif is_float_dtype(df[col]):
-            sql_type = "DOUBLE PRECISION"
-        elif is_bool_dtype(df[col]):
-            sql_type = "BOOLEAN"
-        elif is_datetime64_any_dtype(df[col]):
-            sql_type = "TIMESTAMPTZ"
-        else:
-            sql_type = "TEXT"
+    cols_sql: List[str] = []
+    for col, pg_type in schema.items():
         if col == "id":
-            col_defs.append(f'"{col}" {sql_type} PRIMARY KEY')
+            cols_sql.append(f'"{col}" {pg_type} PRIMARY KEY')
         else:
-            col_defs.append(f'"{col}" {sql_type}')
-    cols_sql = ", ".join(col_defs)
-    cur.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({cols_sql});')
+            cols_sql.append(f'"{col}" {pg_type}')
+    ddl = f'CREATE TABLE IF NOT EXISTS "{table_name}" ({", ".join(cols_sql)});'
+    with conn.cursor() as cur:
+        cur.execute(ddl)
+    conn.commit()
 
-def ensure_unique_index_on_id(cur, table_name: str) -> None:
-    idx_name = f'{table_name.lower()}_id_uidx'.replace('"', "").replace(".", "_")
-    cur.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS {idx_name} ON "{table_name}"("id");')
+def ensure_unique_index_on_id(conn, table_name: str) -> None:
+    idx = f'{table_name.lower()}_id_uidx'.replace('"', "").replace(".", "_")
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON "{table_name}"("id");')
+    conn.commit()
 
-# ---------------------------------
-# Data shaping helpers
-# ---------------------------------
-def coerce_dtype(series: pd.Series, target: str) -> pd.Series:
-    if target == "text":
-        return series.astype("string")
-    if target == "int":
-        return pd.to_numeric(series, errors="coerce").astype("Int64")
-    if target == "float":
-        return pd.to_numeric(series, errors="coerce")
-    if target == "bool":
-        return series.map(
-            lambda v: None
-            if pd.isna(v)
-            else bool(int(v)) if str(v).isdigit()
-            else str(v).strip().lower() in {"true", "t", "1", "yes"}
-        ).astype("boolean")
-    if target == "timestamp":
-        return pd.to_datetime(series, errors="coerce", utc=True)
-    return series
+# =========================
+# Type casting helpers
+# =========================
+def to_bool_series(s: pd.Series) -> pd.Series:
+    return s.map(
+        lambda v: None if pd.isna(v)
+        else bool(int(v)) if str(v).isdigit()
+        else str(v).strip().lower() in {"true", "t", "1", "yes"}
+    ).astype("boolean")
 
-def build_db_dataframe(report_type: str, df: pd.DataFrame) -> pd.DataFrame:
-    schema = DB_SCHEMAS.get(report_type, {})
-    keep = schema.get("keep", [])
-    rename = schema.get("rename", {})
-    dtypes = schema.get("dtypes", {})
+def cast_dataframe_types(df: pd.DataFrame, schema: Dict[str, str]) -> pd.DataFrame:
+    """Coerce columns to expected types per schema."""
+    if df.empty:
+        return df.copy()
 
-    # ensure kept columns exist
-    for col in keep:
+    out = pd.DataFrame()
+    for col, pgtype in schema.items():
         if col not in df.columns:
-            df[col] = pd.NA
+            out[col] = pd.NA
+            continue
 
-    db_df = df[keep].copy()
+        series = df[col]
+        if pgtype.upper() == "TIMESTAMPTZ":
+            out[col] = pd.to_datetime(series, errors="coerce", utc=True)
+        elif pgtype.upper() == "BOOLEAN":
+            out[col] = to_bool_series(series)
+        else:
+            # TEXT (or others) → keep as string; preserve None
+            out[col] = series.astype("string").where(~series.isna(), None)
 
-    # rename if needed
-    if rename:
-        db_df.rename(columns=rename, inplace=True)
+    # psycopg2-friendly NULLs
+    out = out.where(pd.notnull(out), None)
+    return out
 
-    # cast types
-    for col, target in dtypes.items():
-        target_col = rename.get(col, col)
-        if target_col in db_df.columns:
-            db_df[target_col] = coerce_dtype(db_df[target_col], target)
-
-    # psycopg2-friendly nulls
-    db_df = db_df.replace({pd.NA: None})
-    return db_df
-
-def compute_row_hash(row: pd.Series, cols: list) -> str:
+# =========================
+# Hash for update-on-change
+# =========================
+def compute_row_hash(row: pd.Series, cols: List[str]) -> str:
     payload = {c: (None if pd.isna(row[c]) else row[c]) for c in cols if c in row.index}
     s = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+    import hashlib
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
+# =========================
+# API fetch (pagination + early stop by last_seen_id)
+# =========================
 def extract_user_tags(attributes: dict) -> dict:
     out = {}
     ut = attributes.get("usertags", {}) or {}
@@ -307,42 +262,44 @@ def extract_user_tags(attributes: dict) -> dict:
                 out[f"{cat}_{i+1}"] = v
     return out
 
-# ---------------------------------
-# API fetch (incremental via pagination + last_seen_id)
-# ---------------------------------
-def extract_attributes(
-    api_url: str, report_type: str, api_key: str, seen_id: Optional[str]
-) -> Tuple[list, Optional[str]]:
+def fetch_report(report_type: str, api_key: str, seen_id: Optional[str]) -> Tuple[pd.DataFrame, Optional[str]]:
     """
-    Follow links.next when available; fall back to page[number].
-    Stop early when previously-seen id appears.
+    Fetch a report incrementally:
+      - follow links.next if present; else page[number]
+      - stop when previously-seen id encountered
+      - return DataFrame + newest_id (top-most id from first non-empty page)
     """
-    extracted = []
     session = requests.Session()
     headers = {"x-apikey-token": api_key}
 
+    # first URL
+    api_url = f"{BASE_URL}{report_type}?"
+    if report_type == "users":
+        api_url += "user_tag_enabled&"
     next_url = f"{api_url}page[size]=8000&filter[_includedeletedusers]=TRUE"
+
     page = 0
     newest_id = None
     stop = False
+    rows: List[dict] = []
 
     while next_url and not stop:
         page += 1
-        logger.info(f"Fetching page {page} for {report_type}...")
+        logger.info(f"[{report_type}] Fetching page {page} ...")
         try:
             resp = session.get(next_url, headers=headers, timeout=60)
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request error: {e}")
+            logger.error(f"[{report_type}] Request error: {e}")
             break
 
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", 60))
-            logger.warning(f"Rate limit hit. Waiting {retry_after}s...")
+            logger.warning(f"[{report_type}] Rate limit hit. Sleeping {retry_after}s...")
             time.sleep(retry_after)
             continue
 
         if resp.status_code != 200:
-            logger.error(f"API returned {resp.status_code}: {resp.text[:300]}")
+            logger.error(f"[{report_type}] API returned {resp.status_code}: {resp.text[:300]}")
             break
 
         payload = resp.json()
@@ -355,178 +312,133 @@ def extract_attributes(
 
         for it in items:
             if seen_id and it.get("id") == seen_id:
-                logger.info(f"Reached previously seen id={seen_id}; stopping.")
+                logger.info(f"[{report_type}] Reached previously seen id={seen_id}; stopping.")
                 stop = True
                 break
 
             attrs = it.get("attributes", {}) or {}
-            row = {"type": it.get("type"), "id": it.get("id")}
+            row = {"id": it.get("id"), "type": it.get("type")}
+            # flatten attributes (keep usertags encoded as JSON text)
             for k, v in attrs.items():
-                # keep complex 'usertags' by JSON-encoding; skip other dict/list
                 if isinstance(v, (dict, list)):
                     if k == "usertags":
                         row["usertags"] = json.dumps(v, ensure_ascii=False)
                     continue
                 row[k] = v
 
-            if report_type == "users" and "usertags" in attrs:
-                # also expand user tags into flat columns for users (if you want)
-                row.update(extract_user_tags(attrs))
+            # optionally expand usertags to columns for 'users' (skipped here)
+            rows.append(row)
 
-            extracted.append(row)
-
-        links = payload.get("links") or {}
-        next_url = links.get("next")
+        # follow links.next or fallback to page[number]
+        next_url = (payload.get("links") or {}).get("next")
         if not next_url:
             next_url = f"{api_url}page[number]={page+1}&page[size]=8000&filter[_includedeletedusers]=TRUE"
 
-    logger.info(f"Total new/changed records fetched for {report_type}: {len(extracted)}")
-    return extracted, newest_id
-
-def process_report(
-    report_type: str, api_key: str, sso_domain: str, seen_id: Optional[str]
-) -> Tuple[pd.DataFrame, Optional[str]]:
-    api_url = f"{BASE_URL}{report_type}?user_tag_enabled&" if report_type == "users" else f"{BASE_URL}{report_type}?"
-    raw, newest_id = extract_attributes(api_url, report_type, api_key, seen_id)
-    if not raw:
-        return pd.DataFrame(), newest_id
-
-    df = pd.DataFrame(raw)
-    if df.empty:
-        return pd.DataFrame(), newest_id
-
-    # Normalize a known location quirk
+    logger.info(f"[{report_type}] fetched {len(rows)} new rows.")
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    # one known normalization example:
     if "location_1" in df.columns and pd.api.types.is_string_dtype(df["location_1"]):
         df["location_1"] = df["location_1"].str.replace("São Paulo", "Sao Paulo", regex=False)
 
-    # Keep sso_id_email (used in DB), but still filter out rows where useremailaddress == sso_id_email
-    if report_type == "users" and {"useremailaddress", "sso_id"}.issubset(df.columns):
-        df["sso_id_email"] = df["sso_id"].astype(str) + f"@{sso_domain}"
-        df = df[~df["useremailaddress"].isin(df["sso_id_email"])]
-
     return df, newest_id
 
-# ---------------------------------
-# UPSERT (no truncate)
-# ---------------------------------
-def upsert_df(cur, table_name: str, df: pd.DataFrame) -> None:
+# =========================
+# DB write (UPSERT, no truncates)
+# =========================
+def upsert_dataframe(conn, df: pd.DataFrame, table: str, schema: Dict[str, str]) -> None:
     """
-    Upsert using ON CONFLICT(id) DO UPDATE, but only when row_hash differs.
-    Assumes table exists and has a unique/PK on "id".
+    1) Align/cast to schema
+    2) Compute row_hash
+    3) Ensure table & index
+    4) UPSERT with ON CONFLICT(id) DO UPDATE ... WHERE row changed
     """
-    cols = df.columns.tolist()
-    if "row_hash" not in cols:
-        cols.append("row_hash")
+    if df is None or df.empty:
+        return
 
-    col_sql = ", ".join([f'"{c}"' for c in df.columns])
+    # align & types
+    aligned = cast_dataframe_types(df, schema)
+
+    # compute row_hash on all columns except row_hash itself
+    cols_for_hash = [c for c in aligned.columns if c != "row_hash"]
+    aligned["row_hash"] = aligned.apply(lambda r: compute_row_hash(r, cols_for_hash), axis=1)
+
+    # create table if missing
+    ensure_table(conn, table, schema)
+    ensure_unique_index_on_id(conn, table)
+
+    cols = list(aligned.columns)
+    col_sql = ", ".join([f'"{c}"' for c in cols])
     set_sql = ", ".join(
-        [f'"{c}" = EXCLUDED."{c}"' for c in df.columns if c not in ("id", "row_hash")]
-        + ['"row_hash" = EXCLUDED."row_hash"']
+        [f'"{c}" = EXCLUDED."{c}"' for c in cols if c not in ("id", "row_hash")] + ['"row_hash" = EXCLUDED."row_hash"']
     )
     upsert_sql = f"""
-        INSERT INTO "{table_name}" ({col_sql})
+        INSERT INTO "{table}" ({col_sql})
         VALUES %s
         ON CONFLICT ("id") DO UPDATE
         SET {set_sql}
-        WHERE "{table_name}"."row_hash" IS DISTINCT FROM EXCLUDED."row_hash";
+        WHERE "{table}"."row_hash" IS DISTINCT FROM EXCLUDED."row_hash";
     """
 
-    values = [tuple(row) for row in df.itertuples(index=False, name=None)]
-    execute_values(cur, upsert_sql, values, page_size=1000)
+    values = [tuple(row) for row in aligned.itertuples(index=False, name=None)]
+    with conn.cursor() as cur:
+        execute_values(cur, upsert_sql, values, page_size=1000)
+    conn.commit()
+    logger.info(f'Upserted {len(aligned)} rows into "{table}".')
 
-def save_to_postgres_inc(dataframes: dict, db_config: dict) -> None:
-    conn_params = (
-        f"host={db_config['host']} port={db_config['port']} "
-        f"dbname={db_config['dbname']} user={db_config['user']} password={db_config['password']}"
-    )
-    with psycopg2.connect(conn_params) as conn, conn.cursor() as cur:
-        for rt, df_full in dataframes.items():
-            if rt not in TABLE_MAPPING:
-                continue
-            if df_full is None or df_full.empty:
-                continue
-
-            table_name = TABLE_MAPPING[rt]
-
-            # keep only DB columns + cast
-            db_df = build_db_dataframe(rt, df_full)
-
-            # compute row_hash on stored columns
-            hash_cols = [c for c in db_df.columns if c != "row_hash"]
-            db_df["row_hash"] = db_df.apply(lambda r: compute_row_hash(r, hash_cols), axis=1)
-
-            # psycopg2 NULLs
-            db_df = db_df.where(pd.notnull(db_df), None)
-
-            # ensure table exists & unique index
-            ensure_table_exists(cur, table_name, db_df)
-            ensure_unique_index_on_id(cur, table_name)
-
-            # upsert
-            upsert_df(cur, table_name, db_df)
-
-        conn.commit()
-
-# ---------------------------------
+# =========================
 # Main
-# ---------------------------------
-def main() -> None:
-    logger.info("Starting incremental Proofpoint → Postgres sync (DB-only).")
+# =========================
+def main():
+    logger.info("Starting Proofpoint → Postgres incremental sync (DB-only).")
     api_key = read_api_key()
-    db_config = read_config(filename="proofpoint.ini", section="postgresql")
-
-    # Force Highlands_everest
-    db_config["dbname"] = "Highlands_everest"
-    sso_domain = db_config.get("sso_domain", DEFAULT_SSO_DOMAIN)
-
-    if not test_db_connection(db_config):
-        logger.error("Cannot proceed without DB connection.")
+    db = read_db_config("proofpoint.ini", "postgresql")
+    if not test_db_connection(db):
+        logger.error("DB connection failed. Exiting.")
         return
 
-    conn_params = (
-        f"host={db_config['host']} port={db_config['port']} "
-        f"dbname={db_config['dbname']} user={db_config['user']} password={db_config['password']}"
-    )
+    conn_params = dict(host=db["host"], port=db["port"], dbname=db["dbname"], user=db["user"], password=db["password"])
 
-    # watermarks
-    seen_ids = {}
-    with psycopg2.connect(conn_params) as conn:
-        ensure_state_table_exists(conn)
-        for rt in REPORT_TYPES:
-            seen_ids[rt] = get_last_seen_id(conn, rt)
+    # read watermarks
+    with psycopg2.connect(**conn_params) as conn:
+        ensure_state_table(conn)
+        seen_ids = {rt: get_last_seen_id(conn, rt) for rt in REPORT_TYPES}
 
     # fetch in parallel
-    dataframes = {}
-    newest_ids = {}
+    results: Dict[str, pd.DataFrame] = {}
+    newest_ids: Dict[str, Optional[str]] = {}
     with ThreadPoolExecutor(max_workers=min(4, len(REPORT_TYPES))) as ex:
-        futs = {
-            ex.submit(process_report, rt, api_key, sso_domain, seen_ids.get(rt)): rt
-            for rt in REPORT_TYPES
-        }
-        for fut in as_completed(futs):
-            rt = futs[fut]
+        future_map = {ex.submit(fetch_report, rt, api_key, seen_ids.get(rt)): rt for rt in REPORT_TYPES}
+        for fut in as_completed(future_map):
+            rt = future_map[fut]
             try:
-                df, newest_id = fut.result()
-                dataframes[rt] = df
-                newest_ids[rt] = newest_id
+                df, top_id = fut.result()
+                results[rt] = df
+                newest_ids[rt] = top_id
             except Exception as e:
-                logger.error(f"Error processing {rt}: {e}")
-                dataframes[rt] = pd.DataFrame()
+                logger.error(f"Error fetching {rt}: {e}")
+                results[rt] = pd.DataFrame()
+                newest_ids[rt] = None
 
     # upsert to DB
-    save_to_postgres_inc(dataframes, db_config)
+    with psycopg2.connect(**conn_params) as conn:
+        for rt, df in results.items():
+            table = TABLE_MAPPING.get(rt)
+            if not table or df is None or df.empty:
+                continue
+            schema = DB_SCHEMAS[table]
+            upsert_dataframe(conn, df, table, schema)
 
     # persist new watermarks
-    with psycopg2.connect(conn_params) as conn:
+    with psycopg2.connect(**conn_params) as conn:
         for rt, nid in newest_ids.items():
             if nid:
                 set_last_seen_id(conn, rt, nid)
 
-    logger.info("Incremental DB sync complete.")
+    logger.info("Incremental sync complete.")
 
-# ---------------------------------
+# =========================
 # Entrypoint
-# ---------------------------------
+# =========================
 if __name__ == "__main__":
     try:
         main()
