@@ -168,6 +168,8 @@ def process_report(report_type, api_key):
             logger.warning(f"Empty dataframe for {report_type}")
             return pd.DataFrame()
 
+        df.drop(cloumns=['usertags'], erros='ignore', inplace=True)
+        
         # Remove Rows where useremailaddress matches sso_id@whateverdomain.com
         if report_type == 'users' and 'useremailaddress' in df.columns and 'sso_id' in df.columns:
             df['sso_id_email'] = df['sso_id'].astype(str) + '@transunion.com'
@@ -307,8 +309,12 @@ def save_to_postgres(dataframes, db_config):
         for report_type, df in dataframes.items():
             if df is not None and not df.empty:
                 # Replace empty strings with None for better PostgreSQL storage
-                df = df.replace('', None)
                 
+                df = df.replace('', None)
+
+                if location_1 in df.columns:
+                    df[location_1] = df['location_1'].str.replace('São Paulo', Sao Paulo', regex=False)
+                    
                 # Get the specific table name with preserved case
                 table_name = table_mapping.get(report_type)
                 if table_name:
