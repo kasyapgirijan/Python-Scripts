@@ -1,0 +1,23 @@
+Calendar =
+ADDCOLUMNS (
+    CALENDAR (
+        DATE ( YEAR ( MIN ( 'Mod_CDOC_Metrics'[created_date] ) ), MONTH ( MIN ( 'Mod_CDOC_Metrics'[created_date] ) ), DAY ( MIN ( 'Mod_CDOC_Metrics'[created_date] ) ) ),
+        DATE ( YEAR ( MAX ( 'Mod_CDOC_Metrics'[closed_date]  ) ), MONTH ( MAX ( 'Mod_CDOC_Metrics'[closed_date]  ) ), DAY ( MAX ( 'Mod_CDOC_Metrics'[closed_date]  ) ) )
+    ),
+    "Year", YEAR ( [Date] ),
+    "Month Number", MONTH ( [Date] ),
+    "Month", FORMAT ( [Date], "MMM" ),
+
+    /* --- Sunday→Saturday week --- */
+    // Sunday of the week for any [Date]
+    "Week Start",
+        [Date] - WEEKDAY ( [Date], 1 ) + 1,    -- Sunday=1 … Saturday=7
+    "Week End",
+        ([Date] - WEEKDAY ( [Date], 1 ) + 1) + 6,
+    "Week Number",
+        WEEKNUM ( [Date], 1 ),                 -- week starts Sunday
+    "Week Label",
+        VAR ws = [Date] - WEEKDAY ( [Date], 1 ) + 1
+        VAR we = ws + 6
+        RETURN FORMAT ( ws, "d MMM" ) & " - " & FORMAT ( we, "d MMM" )
+)
