@@ -9,15 +9,16 @@ import logging
 import configparser
 from typing import Optional, Tuple, Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin
 
 import requests
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 
-# =========================
+# ======================================
 # Logging
-# =========================
+# ======================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -25,47 +26,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# =========================
+# ======================================
 # API constants
-# =========================
+# ======================================
 BASE_URL = "https://results.us.securityeducation.com/api/reporting/v0.3.0/"
 REPORT_TYPES = ["users", "phishing"]  # enable more later if needed
 
-# =========================
-# DB schema (fixed) – table -> {column: pg_type}
-# Adjust as needed to match exactly what you want to store.
-# =========================
+# ======================================
+# Fixed DB schemas (table -> {column: PG type})
+# Adjust as needed to match exactly what you want.
+# ======================================
 DB_SCHEMAS: Dict[str, Dict[str, str]] = {
     "Mod_ThreatAwareness_Phishing": {
-        # identifiers / types
         "id": "TEXT",
         "type": "TEXT",
-        # event fields
         "eventtype": "TEXT",
         "eventtimestamp": "TIMESTAMPTZ",
         "senttimestamp": "TIMESTAMPTZ",
-        # campaign metadata
         "campaigntype": "TEXT",
         "campaignname": "TEXT",
         "campaignstatus": "TEXT",
         "campaignstartdate": "TIMESTAMPTZ",
         "campaignenddate": "TIMESTAMPTZ",
-        # template
         "templatename": "TEXT",
         "templatesubject": "TEXT",
-        # flags
         "assessmentsarchived": "BOOLEAN",
         "autoenrollment": "BOOLEAN",
-        # user identity
         "sso_id": "TEXT",
         "useremailaddress": "TEXT",
         "userfirstname": "TEXT",
         "userlastname": "TEXT",
         "useractiveflag": "BOOLEAN",
         "userdeleteddate": "TIMESTAMPTZ",
-        # optional raw usertags (JSON-encoded as text)
-        "usertags": "TEXT",
-        # row hash for update-on-change
+        "usertags": "TEXT",   # JSON-encoded as text if present
         "row_hash": "TEXT",
     },
     "Mod_ThreatAwareness_Users": {
@@ -95,9 +88,9 @@ TABLE_MAPPING: Dict[str, str] = {
     "users": "Mod_ThreatAwareness_Users",
 }
 
-# =========================
+# ======================================
 # Config / credentials
-# =========================
+# ======================================
 def read_api_key() -> str:
     """Get API key from env(API_KEY) or api_key.txt."""
     env_key = os.getenv("API_KEY")
@@ -146,9 +139,9 @@ def test_db_connection(db: Dict[str, str]) -> bool:
         logger.error(f"Database connection test failed: {e}")
         return False
 
-# =========================
+# ======================================
 # Watermark state table
-# =========================
+# ======================================
 def ensure_state_table(conn) -> None:
     with conn.cursor() as cur:
         cur.execute("""
@@ -177,14 +170,11 @@ def set_last_seen_id(conn, report_type: str, last_id: str) -> None:
         """, (report_type, last_id))
     conn.commit()
 
-# =========================
+# ======================================
 # Table creation helpers
-# =========================
+# ======================================
 def ensure_table(conn, table_name: str, schema: Dict[str, str]) -> None:
-    """
-    Create table if not exists using fixed schema.
-    'id' is PRIMARY KEY (needed for upsert).
-    """
+    """Create table if not exists using fixed schema. 'id' is PRIMARY KEY."""
     cols_sql: List[str] = []
     for col, pg_type in schema.items():
         if col == "id":
@@ -202,9 +192,9 @@ def ensure_unique_index_on_id(conn, table_name: str) -> None:
         cur.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON "{table_name}"("id");')
     conn.commit()
 
-# =========================
-# Type casting helpers (incl. numpy.bool_ → bool fix)
-# =========================
+# ======================================
+# Type casting helpers (NaT/boolean safe)
+# ======================================
 def to_python_bool(v):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return None
@@ -221,43 +211,46 @@ def to_python_bool(v):
 def cast_dataframe_types(df: pd.DataFrame, schema: Dict[str, str]) -> pd.DataFrame:
     """
     Coerce columns to expected types per schema.
-    Ensures BOOLEAN columns are native Python bool (not numpy.bool_).
+    Ensures:
+      - TIMESTAMPTZ columns are Python datetime or None (no NaT)
+      - BOOLEAN columns are native Python bool or None
+      - TEXT columns are strings or None
     """
     if df.empty:
         return df.copy()
 
     out = pd.DataFrame()
     for col, pgtype in schema.items():
+        pg = pgtype.upper()
         if col not in df.columns:
             out[col] = None
             continue
 
-        series = df[col]
-        pg = pgtype.upper()
+        s = df[col]
         if pg == "TIMESTAMPTZ":
-            out[col] = pd.to_datetime(series, errors="coerce", utc=True)
+            s = pd.to_datetime(s, errors="coerce", utc=True)
+            s = s.astype("object")           # so NaT can become None
+            s = s.where(pd.notnull(s), None)
+            out[col] = s
         elif pg == "BOOLEAN":
-            out[col] = series.apply(to_python_bool)  # <-- ensures native Python bool / None
+            out[col] = s.apply(to_python_bool)
         else:
-            # TEXT (or others) → keep as string; preserve None
-            out[col] = series.astype("string").where(~series.isna(), None)
+            out[col] = s.astype("string").where(~s.isna(), None)
 
-    # psycopg2-friendly NULLs
-    out = out.where(pd.notnull(out), None)
     return out
 
-# =========================
-# Hash for update-on-change
-# =========================
+# ======================================
+# Row hashing for update-on-change
+# ======================================
 def compute_row_hash(row: pd.Series, cols: List[str]) -> str:
     payload = {c: (None if pd.isna(row[c]) else row[c]) for c in cols if c in row.index}
     s = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
     import hashlib
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
-# =========================
+# ======================================
 # API helpers
-# =========================
+# ======================================
 def extract_user_tags(attributes: dict) -> dict:
     out = {}
     ut = attributes.get("usertags", {}) or {}
@@ -275,21 +268,20 @@ def extract_user_tags(attributes: dict) -> dict:
 def fetch_report(report_type: str, api_key: str, seen_id: Optional[str]) -> Tuple[pd.DataFrame, Optional[str]]:
     """
     Fetch a report incrementally:
-      - follow links.next if present; else page[number]
+      - follow links.next (relative URLs handled) or fallback to page[number]
       - stop when previously-seen id encountered
       - return DataFrame + newest_id (top-most id from first non-empty page)
     """
     session = requests.Session()
     headers = {"x-apikey-token": api_key}
 
-    # first URL
     api_url = f"{BASE_URL}{report_type}?"
     if report_type == "users":
         api_url += "user_tag_enabled&"
     next_url = f"{api_url}page[size]=8000&filter[_includedeletedusers]=TRUE"
 
     page = 0
-    newest_id = None
+    newest_id: Optional[str] = None
     stop = False
     rows: List[dict] = []
 
@@ -328,7 +320,7 @@ def fetch_report(report_type: str, api_key: str, seen_id: Optional[str]) -> Tupl
 
             attrs = it.get("attributes", {}) or {}
             row = {"id": it.get("id"), "type": it.get("type")}
-            # flatten attributes (keep usertags encoded as JSON text)
+            # Flatten attributes; keep 'usertags' JSON as text
             for k, v in attrs.items():
                 if isinstance(v, (dict, list)):
                     if k == "usertags":
@@ -338,26 +330,28 @@ def fetch_report(report_type: str, api_key: str, seen_id: Optional[str]) -> Tupl
 
             rows.append(row)
 
-        # follow links.next or fallback to page[number]
-        next_url = (payload.get("links") or {}).get("next")
-        if not next_url:
+        # links.next may be relative → urljoin with BASE_URL
+        raw_next = (payload.get("links") or {}).get("next")
+        if raw_next:
+            next_url = urljoin(BASE_URL, raw_next)
+        else:
             next_url = f"{api_url}page[number]={page+1}&page[size]=8000&filter[_includedeletedusers]=TRUE"
 
     logger.info(f"[{report_type}] fetched {len(rows)} new rows.")
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # Normalize one known edge case
+    # Example normalization
     if "location_1" in df.columns and pd.api.types.is_string_dtype(df["location_1"]):
         df["location_1"] = df["location_1"].str.replace("São Paulo", "Sao Paulo", regex=False)
 
     return df, newest_id
 
-# =========================
+# ======================================
 # DB write (UPSERT, no truncates)
-# =========================
+# ======================================
 def upsert_dataframe(conn, df: pd.DataFrame, table: str, schema: Dict[str, str]) -> None:
     """
-    1) Align/cast to schema (including numpy.bool_ -> bool conversion)
+    1) Align/cast to schema (NaT→None, numpy.bool_→bool)
     2) Compute row_hash
     3) Ensure table & index
     4) UPSERT with ON CONFLICT(id) DO UPDATE ... WHERE row changed
@@ -365,14 +359,13 @@ def upsert_dataframe(conn, df: pd.DataFrame, table: str, schema: Dict[str, str])
     if df is None or df.empty:
         return
 
-    # align & types
     aligned = cast_dataframe_types(df, schema)
+    # belt & suspenders: replace any lingering NaT
+    aligned = aligned.replace({pd.NaT: None})
 
-    # compute row_hash on all columns except row_hash itself
     cols_for_hash = [c for c in aligned.columns if c != "row_hash"]
     aligned["row_hash"] = aligned.apply(lambda r: compute_row_hash(r, cols_for_hash), axis=1)
 
-    # create table if missing
     ensure_table(conn, table, schema)
     ensure_unique_index_on_id(conn, table)
 
@@ -389,22 +382,15 @@ def upsert_dataframe(conn, df: pd.DataFrame, table: str, schema: Dict[str, str])
         WHERE "{table}"."row_hash" IS DISTINCT FROM EXCLUDED."row_hash";
     """
 
-    # ensure Python-native bools before sending to psycopg2 (safety)
-    def py_boolify(x):
-        return x if isinstance(x, bool) or x is None else (bool(x) if str(x).lower() in {"true","t","1","yes"} else (False if str(x).lower() in {"false","f","0","no"} else x))
-    for c, t in schema.items():
-        if t.upper() == "BOOLEAN" and c in aligned.columns:
-            aligned[c] = aligned[c].map(py_boolify)
-
     values = [tuple(row) for row in aligned.itertuples(index=False, name=None)]
     with conn.cursor() as cur:
         execute_values(cur, upsert_sql, values, page_size=1000)
     conn.commit()
     logger.info(f'Upserted {len(aligned)} rows into "{table}".')
 
-# =========================
+# ======================================
 # Main
-# =========================
+# ======================================
 def main():
     logger.info("Starting Proofpoint → Postgres incremental sync (DB-only).")
     api_key = read_api_key()
@@ -453,9 +439,9 @@ def main():
 
     logger.info("Incremental sync complete.")
 
-# =========================
+# ======================================
 # Entrypoint
-# =========================
+# ======================================
 if __name__ == "__main__":
     try:
         main()
