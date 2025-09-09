@@ -320,15 +320,26 @@ def fetch_report(report_type: str, api_key: str, seen_id: Optional[str]) -> Tupl
 
             attrs = it.get("attributes", {}) or {}
             row = {"id": it.get("id"), "type": it.get("type")}
-            # Flatten attributes; keep 'usertags' JSON as text
+
+            # Flatten scalar attributes
             for k, v in attrs.items():
                 if isinstance(v, (dict, list)):
+                    # Keep raw JSON of usertags (optional) for auditing
                     if k == "usertags":
                         row["usertags"] = json.dumps(v, ensure_ascii=False)
                     continue
                 row[k] = v
 
+            # ✅ NEW: expand usertags into columns for users report
+            if report_type == "users":
+                try:
+                    tag_cols = extract_user_tags(attrs)  # returns e.g. department_1, location_1, office_location_1, ...
+                    row.update(tag_cols)
+                except Exception as e:
+                    logger.warning(f"[users] Failed to expand usertags for id={row.get('id')}: {e}")
+
             rows.append(row)
+
 
         # links.next may be relative → urljoin with BASE_URL
         raw_next = (payload.get("links") or {}).get("next")
