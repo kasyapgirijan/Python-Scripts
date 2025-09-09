@@ -93,3 +93,27 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+location_mapping =
+VAR src =
+    DISTINCT ( 'Mod_ThreatAwareness_Users'[office_location_1] )
+RETURN
+    ADDCOLUMNS (
+        src,
+        "Location",
+        VAR ol = [office_location_1]
+        /* remove leading "Remote -"/"Remote-" once, then trim */
+        VAR noRemote =
+            TRIM (
+                IF (
+                    LEFT ( ol, 8 ) = "Remote -",
+                    SUBSTITUTE ( ol, "Remote -", "", 1 ),
+                    IF ( LEFT ( ol, 7 ) = "Remote-", SUBSTITUTE ( ol, "Remote-", "", 1 ), ol )
+                )
+            )
+        /* if there is " - " keep text before it, else keep as-is */
+        VAR dashPos = SEARCH ( " - ", noRemote, 1, 0 )
+        RETURN IF ( dashPos > 0, LEFT ( noRemote, dashPos - 1 ), noRemote )
+    )
+)
