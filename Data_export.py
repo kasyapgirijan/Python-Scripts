@@ -3,36 +3,45 @@ import pandas as pd
 from psycopg2 import sql
 from configparser import ConfigParser
 
-# === 1️⃣ Read database details from .ini file ===
+# === Read DB config from .ini ===
 def read_db_config(filename="db_config.ini", section="postgresql"):
     parser = ConfigParser()
     parser.read(filename)
-
-    db = {}
-    if parser.has_section(section):
-        params = parser.items(section)
-        for param in params:
-            db[param[0]] = param[1]
-    else:
+    if not parser.has_section(section):
         raise Exception(f"Section '{section}' not found in {filename}")
-    return db
+    return dict(parser.items(section))
 
-# === 2️⃣ Create table dynamically based on CSV header ===
+# === Infer PostgreSQL column types ===
+def infer_pg_type(series: pd.Series):
+    if pd.api.types.is_integer_dtype(series):
+        return "BIGINT"
+    elif pd.api.types.is_float_dtype(series):
+        return "DOUBLE PRECISION"
+    elif pd.api.types.is_bool_dtype(series):
+        return "BOOLEAN"
+    elif pd.api.types.is_datetime64_any_dtype(series):
+        return "TIMESTAMP"
+    else:
+        if series.astype(str).map(len).max() > 2500:
+            return "TEXT"
+        return "VARCHAR(2500)"
+
+# === Create table dynamically ===
 def create_table_from_csv(conn, csv_path, table_name):
     df = pd.read_csv(csv_path)
-    columns = df.columns
-
-    # Drop duplicates / clean headers
-    columns = [col.strip().replace(" ", "_").replace("-", "_").lower() for col in columns]
+    df.columns = [c.strip().replace(" ", "_").replace("-", "_").lower() for c in df.columns]
 
     with conn.cursor() as cur:
-        # Drop table if exists (optional safety)
         cur.execute(sql.SQL("DROP TABLE IF EXISTS {};").format(sql.Identifier(table_name)))
 
-        # Create table with id SERIAL and CSV columns
-        col_defs = ["id SERIAL PRIMARY KEY"]
-        for col in columns:
-            col_defs.append(f'"{col}" TEXT')  # You can later infer types
+        col_defs = []
+        for col in df.columns:
+            pg_type = infer_pg_type(df[col])
+            # Mark 'id' as PRIMARY KEY
+            if col == "id":
+                col_defs.append(f'"{col}" {pg_type} PRIMARY KEY')
+            else:
+                col_defs.append(f'"{col}" {pg_type}')
 
         create_query = sql.SQL("CREATE TABLE {} ({});").format(
             sql.Identifier(table_name),
@@ -40,50 +49,48 @@ def create_table_from_csv(conn, csv_path, table_name):
         )
         cur.execute(create_query)
         conn.commit()
-        print(f"✅ Table '{table_name}' created with columns: {columns}")
-    return df, columns
+        print(f"✅ Created table '{table_name}' with {len(df.columns)} columns")
 
-# === 3️⃣ Insert CSV data into the table ===
-def insert_csv_data(conn, df, table_name, columns):
+    return df
+
+# === Insert or Upsert CSV data ===
+def upsert_csv_data(conn, df, table_name):
     with conn.cursor() as cur:
+        cols = list(df.columns)
+        placeholders = ", ".join(["%s"] * len(cols))
+        update_cols = [f"{c}=EXCLUDED.{c}" for c in cols if c != "id"]
+
+        query = sql.SQL("""
+            INSERT INTO {} ({})
+            VALUES ({})
+            ON CONFLICT (id)
+            DO UPDATE SET {};
+        """).format(
+            sql.Identifier(table_name),
+            sql.SQL(", ").join(map(sql.Identifier, cols)),
+            sql.SQL(placeholders),
+            sql.SQL(", ").join(sql.SQL(c) for c in update_cols)
+        )
+
         for _, row in df.iterrows():
-            placeholders = ", ".join(["%s"] * len(columns))
-            query = sql.SQL("INSERT INTO {} ({}) VALUES ({});").format(
-                sql.Identifier(table_name),
-                sql.SQL(", ").join(map(sql.Identifier, columns)),
-                sql.SQL(placeholders)
-            )
             cur.execute(query, tuple(row))
         conn.commit()
-        print(f"📦 Inserted {len(df)} rows into '{table_name}'")
+        print(f"📦 Upserted {len(df)} rows into '{table_name}'")
 
-# === 4️⃣ Main function ===
+# === Main ===
 def main():
-    db_params = read_db_config("db_config.ini")
+    db = read_db_config("db_config.ini")
     csv_path = input("Enter CSV file path: ").strip()
     table_name = input("Enter target table name: ").strip().lower()
 
-    conn = None
-    try:
-        conn = psycopg2.connect(**db_params)
-        print("🧩 Connected to PostgreSQL")
+    conn = psycopg2.connect(**db)
+    print("🧩 Connected to PostgreSQL")
 
-        df, columns = create_table_from_csv(conn, csv_path, table_name)
-        insert_csv_data(conn, df, table_name, columns)
+    df = create_table_from_csv(conn, csv_path, table_name)
+    upsert_csv_data(conn, df, table_name)
 
-    except Exception as e:
-        print(f"❌ Error: {e}")
-    finally:
-        if conn:
-            conn.close()
-            print("🔒 Connection closed.")
+    conn.close()
+    print("🔒 Connection closed.")
 
 if __name__ == "__main__":
     main()
-
-#[postgresql]
-#host = localhost
-#port = 5432
-#dbname = my_database
-#user = my_user
-#password = my_password
