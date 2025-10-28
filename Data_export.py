@@ -57,8 +57,15 @@ def create_table_from_csv(conn, csv_path, table_name):
 def upsert_csv_data(conn, df, table_name):
     with conn.cursor() as cur:
         cols = list(df.columns)
-        placeholders = ", ".join(["%s"] * len(cols))
-        update_cols = [f"{c}=EXCLUDED.{c}" for c in cols if c != "id"]
+        placeholders = sql.SQL(", ").join(sql.Placeholder() * len(cols))
+
+        # Build ON CONFLICT update clause safely with quoted identifiers
+        update_cols = [
+            sql.SQL("{} = EXCLUDED.{}").format(
+                sql.Identifier(c), sql.Identifier(c)
+            )
+            for c in df.columns if c != "id"
+        ]
 
         query = sql.SQL("""
             INSERT INTO {} ({})
@@ -68,8 +75,8 @@ def upsert_csv_data(conn, df, table_name):
         """).format(
             sql.Identifier(table_name),
             sql.SQL(", ").join(map(sql.Identifier, cols)),
-            sql.SQL(placeholders),
-            sql.SQL(", ").join(sql.SQL(c) for c in update_cols)
+            placeholders,
+            sql.SQL(", ").join(update_cols)
         )
 
         for _, row in df.iterrows():
